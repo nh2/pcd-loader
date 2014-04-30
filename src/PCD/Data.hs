@@ -1,9 +1,10 @@
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ScopedTypeVariables, OverloadedStrings #-}
 -- |Parser for PCD (point cloud data) files.
 module PCD.Data (-- * Accessing fields
-                 FieldType(..), unsafeUnwrap, 
+                 FieldType(..), unsafeUnwrap,
                  -- * Loading PCD data
-                 loadFieldsByName, loadFlexiblePoints, loadXyzw, loadXyz, 
+                 loadFieldsByName, loadFlexiblePoints, loadXyzw, loadXyz,
+                 loadXyzRgb, loadXyzRgbNormal,
                  -- * Saving PCD data
                  saveBinaryPcd, projectBinaryFields,
                  -- * PCD header creation
@@ -12,25 +13,30 @@ import Control.Applicative
 import Control.DeepSeq
 import Control.Lens ((.~), (^.))
 import qualified Data.Attoparsec.Text.Lazy as ATL
+import Data.Bits ((.&.), unsafeShiftR)
 import Data.Text (Text)
+import Data.ReinterpretCast (floatToWord)
 import qualified Data.Text.IO as T
 import qualified Data.Vector as B
 import qualified Data.Vector.Storable as V
 import qualified Data.Vector.Storable.Mutable as VM
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Storable (Storable, sizeOf)
-import System.IO (Handle, openFile, hClose, 
+import System.IO (Handle, openFile, hClose,
                   IOMode(..), withBinaryFile, hPutBuf, hGetBuf)
 import PCD.Header
 import qualified PCD.Internal.AsciiParsers as A
 import PCD.Internal.StorableFieldType
 import PCD.Internal.Types
 
+import PCD.Point.XyzRgb
+import PCD.Point.XyzRgbNormal
+
 -- |Read back 'Storable' points saved as binary data.
-readStorableBinaryPoints :: forall a. Storable a => 
+readStorableBinaryPoints :: forall a. Storable a =>
                               Header -> Handle -> IO (Either String (Vector a))
 readStorableBinaryPoints pcd h
-  | ptSize /= sz = return . Left $ 
+  | ptSize /= sz = return . Left $
                    "Deserialization type is not the same size as the points "++
                    "described by this file. The PCD file dicates "++
                    show ptSize++" bytes per point; destination type takes up "++
@@ -46,8 +52,8 @@ readStorableBinaryPoints pcd h
 -- parser for the point data type and a 'Storable' instance. If you
 -- know that your points are binary or ASCII, consider using
 -- 'readBinPoints' or 'readAsciiPoints'.
-readPointData :: Storable a => 
-                 Header -> Handle -> ATL.Parser a -> 
+readPointData :: Storable a =>
+                 Header -> Handle -> ATL.Parser a ->
                  IO (Either String (Vector a))
 readPointData header handle parser
   | header^.format == ASCII = Right <$> A.readPoints header handle parser
@@ -56,9 +62,9 @@ readPointData header handle parser
 -- |Use an existing PCD header to save binary point data to a
 -- file. The supplied header is used as-is, except that its format is
 -- set to 'Binary'.
-saveBinaryPcd :: forall a. Storable a => 
+saveBinaryPcd :: forall a. Storable a =>
                  FilePath -> Header -> V.Vector a -> IO ()
-saveBinaryPcd outputFile pcd pts = 
+saveBinaryPcd outputFile pcd pts =
   do putStrLn $ "Converting "++show (V.length pts)++" points"
      let pcd' = format .~ Binary $ pcd
          sz = sizeOf (undefined::a) * V.length pts
@@ -73,7 +79,7 @@ saveBinaryPcd outputFile pcd pts =
 -- accomplished using, @projectBinaryFields [\"x\", \"y\", \"z\"]
 -- inputFile outputFile@.
 projectBinaryFields :: [Text] -> FilePath -> FilePath -> IO ()
-projectBinaryFields fs i o = 
+projectBinaryFields fs i o =
   do h <- openFile i ReadMode
      (pcdh,_) <- readHeader h
      v <- loadFlexiblePoints pcdh h
@@ -92,7 +98,7 @@ projectBinaryFields fs i o =
          hPutBuf h' ptr numBytes
      return ()
 
--- |Load points stored in a PCD file into a 'Vector'. This requires a
+-- |Load points storeXyzRgbNormald in a PCD file into a 'Vector'. This requires a
 -- 'Storable' instance for the type used to represent a point. If the
 -- point is a monotyped collection of fields, consider using
 -- 'Linear.V2', 'Linear.V3', or 'Linear.V4' to represent points. When
@@ -137,11 +143,54 @@ loadFlexiblePoints pcdh h
 loadFieldsByName :: FilePath -> IO (Text -> B.Vector FieldType)
 loadFieldsByName f = do h <- openFile f ReadMode
                         (pcdh,_) <- readHeader h
-                        (mkProjector pcdh <$> loadFlexiblePoints pcdh h) 
+                        (mkProjector pcdh <$> loadFlexiblePoints pcdh h)
                           <* hClose h
-  where mkProjector :: Header -> B.Vector (B.Vector FieldType) -> 
+  where mkProjector :: Header -> B.Vector (B.Vector FieldType) ->
                        (Text -> B.Vector FieldType)
         mkProjector h pts = let fieldNames = B.fromList $ h ^. fields
-                            in \name -> maybe B.empty 
+                            in \name -> maybe B.empty
                                               (flip B.map pts . flip (B.!))
                                               (B.findIndex (name==) fieldNames)
+
+
+-- Parses a float, but can also parse "nan", "inf" and "-inf"
+-- (the se can appear in PCD files).
+-- We only allow lower case for those (as PCL's `cout <<` does it).
+parsePCDFloat :: ATL.Parser Float
+parsePCDFloat = (realToFrac <$> ATL.double)
+                <|> ( nan <$ ATL.string  "nan")
+                <|> ( inf <$ ATL.string  "inf")
+                <|> (-inf <$ ATL.string "-inf")
+  where
+    nan = 0/0 -- Unfortunately this is the correct way
+    inf = 1/0 -- to get nan and inf.
+
+
+loadXyzRgb :: FilePath -> IO (Vector XyzRgb)
+loadXyzRgb = loadPoints readXyzRgb
+
+readXyzRgb :: ATL.Parser XyzRgb
+readXyzRgb = (\[x,y,z,fRgb] -> XyzRgb (V3 x y z) (fromFloatRGB fRgb)) <$>
+             ATL.count 4 (parsePCDFloat <* ATL.skipSpace)
+  where
+    (>>>) = unsafeShiftR
+    fromFloatRGB fRgb = let w = floatToWord fRgb
+                            r = (w >>> 24) .&. 0xff
+                            g = (w >>> 16) .&. 0xff
+                            b = (w >>>  8) .&. 0xff
+                         in V3 (fromIntegral r) (fromIntegral g) (fromIntegral b)
+
+
+loadXyzRgbNormal :: FilePath -> IO (Vector XyzRgbNormal)
+loadXyzRgbNormal = loadPoints readXyzRgbNormal
+
+readXyzRgbNormal :: ATL.Parser XyzRgbNormal
+readXyzRgbNormal = (\[x,y,z,fRgb,nx,ny,nz,curv] -> XyzRgbNormal (V3 x y z) (fromFloatRGB fRgb) (V3 nx ny nz) curv) <$>
+                   ATL.count 8 (parsePCDFloat <* ATL.skipSpace)
+  where
+    (>>>) = unsafeShiftR
+    fromFloatRGB fRgb = let w = floatToWord fRgb
+                            r = (w >>> 24) .&. 0xff
+                            g = (w >>> 16) .&. 0xff
+                            b = (w >>>  8) .&. 0xff
+                         in V3 (fromIntegral r) (fromIntegral g) (fromIntegral b)

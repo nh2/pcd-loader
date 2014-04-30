@@ -4,6 +4,8 @@ import Control.Applicative
 import Control.Lens ((^.))
 import Data.Attoparsec.Text (double, count, skipSpace)
 import qualified Data.Attoparsec.Text.Lazy as ATL
+import Data.List (intercalate)
+import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.IO as TL
 import qualified Data.Vector as B
 import qualified Data.Vector.Generic as G
@@ -14,7 +16,7 @@ import PCD.Header (Header, FieldType, pointParser, points)
 import PCD.Internal.Types (V3(..), V4(..))
 
 -- |Read point data using a user-supplied ASCII point parser.
-readPoints :: (G.Vector v a) => 
+readPoints :: (G.Vector v a) =>
                    Header -> Handle -> ATL.Parser a -> IO (v a)
 readPoints pcd h p = aux <$> TL.hGetContents h
   where n = fromIntegral $ pcd^.points
@@ -24,9 +26,10 @@ readPoints pcd h p = aux <$> TL.hGetContents h
                         go !i !t
                           | i == n = return v
                           | otherwise = case ATL.parse p t of
-                                          ATL.Done !t' !pt -> write i pt >> 
+                                          ATL.Done !t' !pt -> write i pt >>
                                                               go (i+1) t'
-                                          ATL.Fail _ _ msg -> error msg
+                                          ATL.Fail t' errs msg -> error $ msg ++ " - errors: [" ++ intercalate ", " errs ++ "] - remaining input:"
+                                                                          ++ show (TL.take 100 t') ++ "..."
                     go 0 t0
 
 -- |Load points of arbitrary dimension into a boxed vector with a
@@ -36,7 +39,7 @@ readPointsDefault pcd h = readPoints pcd h $ B.fromList <$> pointParser pcd
 
 -- |Parse 3D points serialized in ASCII.
 readXYZ :: Fractional a => ATL.Parser (V3 a)
-readXYZ = (\[x,y,z] -> V3 x y z) <$> 
+readXYZ = (\[x,y,z] -> V3 x y z) <$>
           count 3 ((realToFrac <$> double) <* skipSpace)
 
 -- |Parse 4D points serialized to ASCII. This is useful for points
